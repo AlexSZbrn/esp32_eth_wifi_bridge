@@ -880,7 +880,12 @@ static int show(int argc, char **argv)
         printf("Connected WiFi clients: %u\n", connect_count);
 
         // Byte counts
-        printf("Bytes sent/received: %" PRIu64 " / %" PRIu64 " bytes\n", get_sta_bytes_sent(), get_sta_bytes_received());
+        {
+            char sent_buf[16], recv_buf[16];
+            format_bytes_human(get_sta_bytes_sent(), sent_buf, sizeof(sent_buf));
+            format_bytes_human(get_sta_bytes_received(), recv_buf, sizeof(recv_buf));
+            printf("Bytes sent/received: %s / %s\n", sent_buf, recv_buf);
+        }
 
 #if defined(CONFIG_ETH_UPLINK_W5500)
         {
@@ -938,8 +943,8 @@ static int show(int argc, char **argv)
                     for (int j = 0; j < stats_count; j++) {
                         if (memcmp(stats[j].mac, sta_list.sta[i].mac, 6) == 0) {
                             char tx_buf[12], rx_buf[12];
-                            format_bytes_human(stats[j].bytes_sent, tx_buf, sizeof(tx_buf));
-                            format_bytes_human(stats[j].bytes_received, rx_buf, sizeof(rx_buf));
+                            format_bytes_human(stats[j].bytes_received, tx_buf, sizeof(tx_buf));
+                            format_bytes_human(stats[j].bytes_sent, rx_buf, sizeof(rx_buf));
                             snprintf(traffic_str, sizeof(traffic_str), "%s / %s", tx_buf, rx_buf);
                             break;
                         }
@@ -1709,12 +1714,12 @@ static void register_remote_console_cmd(void)
         .command = "remote_console",
         .help = "Manage remote console (network CLI access)\n"
                 "  remote_console status              - Show status and connection info\n"
-                "  remote_console enable               - Enable remote console\n"
-                "  remote_console disable              - Disable remote console\n"
-                "  remote_console port <port>          - Set TCP port (default: 2323)\n"
-                "  remote_console bind <ap,eth>         - Set interface binding\n"
-                "  remote_console timeout <seconds>    - Set idle timeout (0=none)\n"
-                "  remote_console kick                 - Disconnect current session",
+                "  remote_console enable              - Enable remote console\n"
+                "  remote_console disable             - Disable remote console\n"
+                "  remote_console port <port>         - Set TCP port (default: 2323)\n"
+                "  remote_console bind <ap,eth>       - Set interface binding\n"
+                "  remote_console timeout <seconds>   - Set idle timeout (0=none)\n"
+                "  remote_console kick                - Disconnect current session",
         .hint = " <action> [<args>]",
         .func = &remote_console_cmd,
     };
@@ -1806,8 +1811,7 @@ static int set_tz_cmd(int argc, char **argv)
         printf("Examples:\n");
         printf("  set_tz UTC               - UTC\n");
         printf("  set_tz CET-1CEST,M3.5.0,M10.5.0/3  - Central Europe\n");
-        printf("  set_tz EST5EDT,M3.2.0,M11.1.0       - US Eastern\n");
-        printf("  set_tz PST8PDT,M3.2.0,M11.1.0       - US Pacific\n");
+        printf("  set_tz EST5EDT,M3.2.0,M11.1.0      - US Eastern\n");
         printf("  set_tz clear             - Clear timezone (revert to UTC)\n");
         return 0;
     }
@@ -1886,7 +1890,7 @@ static void register_set_spi_clock(void)
     set_spi_clock_arg.end = arg_end(1);
     const esp_console_cmd_t cmd = {
         .command = "set_spi_clock",
-        .help = "Set W5500 SPI clock speed in MHz (1-80). Saved to NVS, applied after restart.",
+        .help = "Set W5500 SPI clock speed in MHz (1-80, rounded to 80/n). Saved to NVS, applied after restart.",
         .hint = " <MHz>",
         .func = &set_spi_clock_cmd,
         .argtable = &set_spi_clock_arg
