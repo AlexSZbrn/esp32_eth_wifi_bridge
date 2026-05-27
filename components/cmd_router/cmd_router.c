@@ -75,6 +75,7 @@ static void register_set_tx_power(void);
 static void register_remote_console_cmd(void);
 static void register_syslog_cmd(void);
 static void register_set_tz(void);
+static void register_set_wifi_country(void);
 #if defined(CONFIG_ETH_UPLINK_W5500)
 static void register_set_spi_clock(void);
 static void register_w5500(void);
@@ -267,6 +268,7 @@ void register_router(void)
     register_remote_console_cmd();
     register_syslog_cmd();
     register_set_tz();
+    register_set_wifi_country();
 #if defined(CONFIG_ETH_UPLINK_W5500)
     register_set_spi_clock();
     register_w5500();
@@ -995,6 +997,7 @@ static int show(int argc, char **argv)
         printf("  Channel: %s", ap_channel > 0 ? "" : "auto\n");
         if (ap_channel > 0) printf("%d\n", ap_channel);
         printf("  Hidden: %s\n", ap_ssid_hidden ? "yes" : "no");
+        printf("  Country Code: %s\n", wifi_country_code);
 
         char* web_lock = NULL;
         get_config_param_str("web_disabled", &web_lock);
@@ -1495,8 +1498,14 @@ static int set_ap_channel_cmd(int argc, char **argv)
     }
 
     int channel_val = atoi(argv[1]);
-    if (channel_val < 0 || channel_val > 13) {
-        printf("Invalid channel. Use 0 (auto) or 1-13.\n");
+    wifi_country_t country_info;
+    int max_channel = 13;
+    if (esp_wifi_get_country(&country_info) == ESP_OK) {
+        max_channel = country_info.schan + country_info.nchan - 1;
+    }
+    if (channel_val < 0 || channel_val > max_channel) {
+        printf("Invalid channel. Use 0 (auto) or 1-%d (country: %s).\n",
+               max_channel, wifi_country_code);
         return 1;
     }
 
@@ -1519,9 +1528,70 @@ static void register_set_ap_channel(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "set_ap_channel",
-        .help = "Set AP WiFi channel (0=auto, 1-13=fixed, requires restart)",
+        .help = "Set AP WiFi channel (0=auto, 1-13 max depends on country code, requires restart)",
         .hint = NULL,
         .func = &set_ap_channel_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_wifi_country' command - set WiFi regulatory country code */
+static int set_wifi_country_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Current country code: %s\n", wifi_country_code);
+        printf("Usage: set_wifi_country <CC>\n");
+        printf("  CC: 2-char ISO 3166 code (e.g. US, DE, GB) or 01 for world-safe\n");
+        printf("  Default: 01 (world-safe, all standard channels allowed)\n");
+        return 0;
+    }
+
+    const char *cc = argv[1];
+    if (strlen(cc) != 2) {
+        printf("Country code must be exactly 2 characters (e.g. US, DE, 01).\n");
+        return 1;
+    }
+
+    char upper[3];
+    upper[0] = toupper((unsigned char)cc[0]);
+    upper[1] = toupper((unsigned char)cc[1]);
+    upper[2] = '\0';
+
+    esp_err_t err = set_config_param_str("wifi_cc", upper);
+    if (err != ESP_OK) {
+        printf("Failed to save country code: %s\n", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_country_code[0] = upper[0];
+    wifi_country_code[1] = upper[1];
+    wifi_country_code[2] = '\0';
+
+    esp_err_t ret = esp_wifi_set_country_code(wifi_country_code, true);
+    if (ret == ESP_OK) {
+        wifi_country_t ci;
+        if (esp_wifi_get_country(&ci) == ESP_OK && ap_channel > 0) {
+            int max_ch = ci.schan + ci.nchan - 1;
+            if (ap_channel > max_ch) {
+                printf("Warning: ap_channel %d exceeds max channel %d for country %s.\n",
+                       ap_channel, max_ch, wifi_country_code);
+                printf("Run 'set_ap_channel 0' (auto) or a valid channel, then restart.\n");
+            }
+        }
+        printf("Country code set to %s (applied immediately, saved for reboot).\n", wifi_country_code);
+    } else {
+        printf("Country code %s saved. Could not apply now: %s\n", wifi_country_code, esp_err_to_name(ret));
+    }
+    return 0;
+}
+
+static void register_set_wifi_country(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_wifi_country",
+        .help = "Set WiFi regulatory country code (2-char ISO 3166, e.g. US, DE; or 01 for world-safe)",
+        .hint = NULL,
+        .func = &set_wifi_country_cmd,
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }

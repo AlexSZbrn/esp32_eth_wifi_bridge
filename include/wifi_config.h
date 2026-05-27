@@ -20,6 +20,9 @@ extern char* ap_passwd;
 extern char* ap_dns;
 extern char* hostname;
 
+// WiFi regulatory country code (2-char + NUL, e.g. "US", "DE", "01" = world-safe)
+extern char wifi_country_code[3];
+
 extern uint16_t connect_count;
 extern bool ap_connect;
 

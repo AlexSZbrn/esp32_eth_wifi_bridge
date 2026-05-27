@@ -198,6 +198,7 @@ Connect via serial at 115200 bps, or via the remote console.
 | `set_ap_hidden <on\|off>` | Hide or show AP SSID |
 | `set_ap_auth <wpa2\|wpa3\|wpa2wpa3>` | Set AP authentication mode |
 | `set_ap_channel <0-13>` | Set AP WiFi channel (0=auto) |
+| `set_wifi_country <CC>` | Set WiFi regulatory country code (2-char ISO 3166, e.g. `US`, `DE`; use `01` for world-safe) |
 | `ap <enable\|disable>` | Enable or disable AP interface |
 | `set_mgmt_ip <ip> <mask> <gw>` | Set static management IP |
 | `set_mgmt_ip dhcp` | Revert management IP to DHCP |

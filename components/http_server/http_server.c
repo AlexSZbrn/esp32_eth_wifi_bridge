@@ -774,9 +774,29 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                     // Handle AP channel setting
                     if (httpd_query_key_value(buf, "ap_channel", param5, sizeof(param5)) == ESP_OK) {
                         int channel_val = atoi(param5);
-                        if (channel_val >= 0 && channel_val <= 13) {
+                        wifi_country_t _ci2;
+                        int max_ch = 13;
+                        if (esp_wifi_get_country(&_ci2) == ESP_OK) {
+                            max_ch = _ci2.schan + _ci2.nchan - 1;
+                        }
+                        if (channel_val >= 0 && channel_val <= max_ch) {
                             set_config_param_int("ap_channel", channel_val);
                             ap_channel = (uint8_t)channel_val;
+                        }
+                    }
+
+                    // Handle WiFi country code setting
+                    if (httpd_query_key_value(buf, "wifi_cc", param5, sizeof(param5)) == ESP_OK) {
+                        if (strlen(param5) == 2) {
+                            char upper[3];
+                            upper[0] = toupper((unsigned char)param5[0]);
+                            upper[1] = toupper((unsigned char)param5[1]);
+                            upper[2] = '\0';
+                            set_config_param_str("wifi_cc", upper);
+                            wifi_country_code[0] = upper[0];
+                            wifi_country_code[1] = upper[1];
+                            wifi_country_code[2] = '\0';
+                            esp_wifi_set_country_code(wifi_country_code, true);
                         }
                     }
 
@@ -969,11 +989,16 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     httpd_resp_send_chunk(req, CONFIG_CHUNK_SCRIPT, HTTPD_RESP_USE_STRLEN);
 
     /* Chunk 4: AP Settings */
+    wifi_country_t _ci;
+    int max_channel = 13;
+    if (esp_wifi_get_country(&_ci) == ESP_OK) {
+        max_channel = _ci.schan + _ci.nchan - 1;
+    }
     const char* auth_sel0 = (ap_authmode == 0) ? "selected" : "";
     const char* auth_sel1 = (ap_authmode == 1) ? "selected" : "";
     const char* auth_sel2 = (ap_authmode == 2) ? "selected" : "";
     snprintf(section, sizeof(section), CONFIG_CHUNK_AP,
-        safe_ap_ssid, (int)ap_channel,
+        safe_ap_ssid, max_channel, (int)ap_channel, wifi_country_code,
         auth_sel0, auth_sel1, auth_sel2,
         ap_en_checked, ap_open_checked, ap_hidden_checked);
     httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);

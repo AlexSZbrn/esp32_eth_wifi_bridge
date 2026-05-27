@@ -72,6 +72,9 @@ uint8_t ap_authmode = 0;
 // AP WiFi channel (0 = auto/1, 1-13 = fixed channel)
 uint8_t ap_channel = 0;
 
+// WiFi regulatory country code ("01" = world-safe default)
+char wifi_country_code[3] = "01";
+
 /* FreeRTOS event group to signal when we are connected */
 static EventGroupHandle_t wifi_event_group;
 const int WIFI_CONNECTED_BIT = BIT0;
@@ -621,6 +624,20 @@ void app_main(void)
         if (channel_setting >= 1 && channel_setting <= 13) ap_channel = (uint8_t)channel_setting;
     }
 
+    // Load WiFi country code from NVS (default "01" = world-safe)
+    {
+        char *saved_cc = NULL;
+        if (get_config_param_str("wifi_cc", &saved_cc) == ESP_OK && saved_cc != NULL) {
+            if (strlen(saved_cc) == 2) {
+                wifi_country_code[0] = saved_cc[0];
+                wifi_country_code[1] = saved_cc[1];
+                wifi_country_code[2] = '\0';
+            }
+            free(saved_cc);
+        }
+        ESP_LOGI(TAG, "WiFi country code: %s", wifi_country_code);
+    }
+
     // Initialize bridge
     bridge_init(static_ip, subnet_mask, gateway_addr, ap_mac, ap_ssid, ap_passwd);
 
@@ -635,6 +652,16 @@ void app_main(void)
             ESP_LOGI(TAG, "TX power set to %.1f dBm", actual * 0.25);
         } else {
             ESP_LOGW(TAG, "Failed to set TX power: %s", esp_err_to_name(ret));
+        }
+    }
+
+    // Apply WiFi country code (must be after esp_wifi_init inside bridge_init)
+    {
+        esp_err_t ret = esp_wifi_set_country_code(wifi_country_code, true);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi country code applied: %s", wifi_country_code);
+        } else {
+            ESP_LOGW(TAG, "Failed to apply WiFi country code %s: %s", wifi_country_code, esp_err_to_name(ret));
         }
     }
 
