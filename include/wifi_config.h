@@ -20,6 +20,13 @@ extern char* ap_passwd;
 extern char* ap_dns;
 extern char* hostname;
 
+// DHCP server configuration
+extern bool     dhcps_enabled;
+extern char    *dhcps_start_ip;
+extern char    *dhcps_end_ip;
+extern uint32_t dhcps_lease_min;
+extern char    *dhcps_dns_ip;
+
 // WiFi regulatory country code (2-char + NUL, e.g. "US", "DE", "01" = world-safe)
 extern char wifi_country_code[3];
 

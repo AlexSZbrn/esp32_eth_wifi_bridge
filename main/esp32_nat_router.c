@@ -46,6 +46,7 @@
 #include "lwip/opt.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include "dhcpserver/dhcpserver.h"
 
 #include "cmd_system.h"
 #include "cmd_router.h"
@@ -222,9 +223,17 @@ static void eth_event_handler(void* arg, esp_event_base_t event_base,
             // bridgeif_init() in lwIP hardcodes netif->hostname = "lwip"; override it here
             // after the bridge netif is fully initialized, before DHCP sends DISCOVER
             esp_netif_set_hostname(br_netif, hostname);
-            // For static IP, no GOT_IP fires — join multicast now that the netif is up
+            // For static IP (including DHCP server mode), no IP_EVENT_ETH_GOT_IP fires
             if (has_static_ip) {
                 mdns_responder_set_ip(esp_ip4addr_aton(static_ip));
+                if (dhcps_enabled) {
+                    // BR_DHCPS preset has get_ip_event=0 so no IP_EVENT fires — activate here
+                    ap_connect = true;
+                    init_byte_counter();
+                    syslog_notify_connected();
+                    xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+                    ESP_LOGI(TAG, "Bridge DHCP server active at %s", static_ip);
+                }
             }
         } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
             ESP_LOGI(TAG, "Ethernet link down");
@@ -302,6 +311,36 @@ static wifi_auth_mode_t get_ap_authmode(void)
         case 2: return WIFI_AUTH_WPA3_PSK;
         default: return WIFI_AUTH_WPA2_WPA3_PSK;
     }
+}
+
+static void dhcps_configure(esp_netif_t *netif, const esp_netif_ip_info_t *ip_info)
+{
+    // Lease time in LWIP units (CONFIG_LWIP_DHCPS_LEASE_UNIT seconds each)
+    uint32_t lease_raw = (dhcps_lease_min * 60) / CONFIG_LWIP_DHCPS_LEASE_UNIT;
+    if (lease_raw == 0) lease_raw = 120;
+    esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_IP_ADDRESS_LEASE_TIME,
+                           &lease_raw, sizeof(lease_raw));
+
+    if (dhcps_start_ip && *dhcps_start_ip && dhcps_end_ip && *dhcps_end_ip) {
+        dhcps_lease_t lease = {
+            .enable   = true,
+            .start_ip = { .addr = esp_ip4addr_aton(dhcps_start_ip) },
+            .end_ip   = { .addr = esp_ip4addr_aton(dhcps_end_ip)   },
+        };
+        esp_err_t err = esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET,
+                                               ESP_NETIF_REQUESTED_IP_ADDRESS,
+                                               &lease, sizeof(lease));
+        if (err != ESP_OK)
+            ESP_LOGW(TAG, "DHCP pool range rejected (%s), using defaults", esp_err_to_name(err));
+    }
+
+    esp_netif_dns_info_t dns_info = {};
+    dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    dns_info.ip.u_addr.ip4.addr = (dhcps_dns_ip && *dhcps_dns_ip)
+                                    ? esp_ip4addr_aton(dhcps_dns_ip)
+                                    : ip_info->ip.addr;
+    esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_info);
 }
 
 void bridge_init(const char* static_ip, const char* subnet_mask, const char* gateway_addr,
@@ -441,8 +480,17 @@ void bridge_init(const char* static_ip, const char* subnet_mask, const char* gat
     wifi_port_netif = esp_netif_create_wifi(WIFI_IF_AP, &wifi_netif_config);
     ESP_ERROR_CHECK(esp_wifi_set_default_wifi_ap_handlers());
 
-    // --- Bridge netif (management IP via DHCP or static) ---
-    esp_netif_inherent_config_t br_config = ESP_NETIF_INHERENT_DEFAULT_BR();
+    // --- Bridge netif (management IP via DHCP client, static, or DHCP server) ---
+    bool use_dhcps = (dhcps_enabled && strlen(static_ip) > 0 && strlen(subnet_mask) > 0);
+    if (dhcps_enabled && !use_dhcps)
+        ESP_LOGW(TAG, "DHCP server disabled: requires static IP and subnet mask");
+
+    // DHCP server handle is only allocated when ESP_NETIF_DHCP_SERVER flag is set at creation
+    esp_netif_inherent_config_t br_config = use_dhcps
+        ? (esp_netif_inherent_config_t)ESP_NETIF_INHERENT_DEFAULT_BR_DHCPS()
+        : (esp_netif_inherent_config_t)ESP_NETIF_INHERENT_DEFAULT_BR();
+    br_config.ip_info = NULL;  // override preset default; IP set explicitly below
+
     bridgeif_config_t bridgeif_config = {
         .max_fdb_dyn_entries = CONFIG_BRIDGE_FDB_MAX_ENTRIES,
         .max_fdb_sta_entries = 2,
@@ -461,8 +509,9 @@ void bridge_init(const char* static_ip, const char* subnet_mask, const char* gat
     };
     br_netif = esp_netif_new(&br_netif_cfg);
 
-    // Stop DHCP before attach so it cannot send a DISCOVER before hostname is set
-    esp_netif_dhcpc_stop(br_netif);
+    // Stop whichever DHCP service is default-active before attach / IP config
+    if (use_dhcps) esp_netif_dhcps_stop(br_netif);
+    else           esp_netif_dhcpc_stop(br_netif);
 
     // Bridge glue: attach ports (this creates the lwIP bridge netif internally)
     esp_netif_br_glue_handle_t br_glue = esp_netif_br_glue_new();
@@ -474,9 +523,22 @@ void bridge_init(const char* static_ip, const char* subnet_mask, const char* gat
     esp_netif_set_hostname(br_netif, hostname);
     esp_netif_set_hostname(eth_port_netif, hostname);
 
-    // Static IP on bridge if configured
+    // Configure IP and start appropriate DHCP mode
     uint32_t initial_ip = 0;
-    if (strlen(static_ip) > 0 && strlen(subnet_mask) > 0 && strlen(gateway_addr) > 0) {
+    if (use_dhcps) {
+        has_static_ip = true;
+        esp_netif_ip_info_t ipInfo = {
+            .ip      = { .addr = esp_ip4addr_aton(static_ip) },
+            .gw      = { .addr = esp_ip4addr_aton(strlen(gateway_addr) > 0 ? gateway_addr : static_ip) },
+            .netmask = { .addr = esp_ip4addr_aton(subnet_mask) },
+        };
+        ESP_ERROR_CHECK(esp_netif_set_ip_info(br_netif, &ipInfo));
+        initial_ip = ipInfo.ip.addr;
+        my_ip      = ipInfo.ip.addr;
+        dhcps_configure(br_netif, &ipInfo);
+        ESP_LOGI(TAG, "Starting DHCP server on " IPSTR, IP2STR(&ipInfo.ip));
+        ESP_ERROR_CHECK(esp_netif_dhcps_start(br_netif));
+    } else if (strlen(static_ip) > 0 && strlen(subnet_mask) > 0 && strlen(gateway_addr) > 0) {
         has_static_ip = true;
         esp_netif_ip_info_t ipInfo;
         ipInfo.ip.addr = esp_ip4addr_aton(static_ip);
@@ -522,6 +584,12 @@ char* ap_ssid = NULL;
 char* ap_passwd = NULL;
 char* ap_dns = NULL;
 char* hostname = NULL;
+
+bool     dhcps_enabled   = false;
+char    *dhcps_start_ip  = NULL;
+char    *dhcps_end_ip    = NULL;
+uint32_t dhcps_lease_min = 120;
+char    *dhcps_dns_ip    = NULL;
 
 char* param_set_default(const char* def_val) {
     char * retval = malloc(strlen(def_val)+1);
@@ -583,6 +651,24 @@ void app_main(void)
     if (ap_dns == NULL) ap_dns = param_set_default("");
     get_config_param_str("hostname", &hostname);
     if (hostname == NULL || hostname[0] == '\0') hostname = param_set_default(DEFAULT_HOSTNAME);
+
+    // Load DHCP server config from NVS
+    {
+        int dhcps_en = 0;
+        if (get_config_param_int("dhcps_enabled", &dhcps_en) == ESP_OK) dhcps_enabled = (dhcps_en != 0);
+        get_config_param_str("dhcps_start_ip", &dhcps_start_ip);
+        if (!dhcps_start_ip) dhcps_start_ip = param_set_default("");
+        get_config_param_str("dhcps_end_ip", &dhcps_end_ip);
+        if (!dhcps_end_ip)   dhcps_end_ip   = param_set_default("");
+        int dhcps_lease = 120;
+        if (get_config_param_int("dhcps_lease", &dhcps_lease) == ESP_OK && dhcps_lease > 0)
+            dhcps_lease_min = (uint32_t)dhcps_lease;
+        get_config_param_str("dhcps_dns", &dhcps_dns_ip);
+        if (!dhcps_dns_ip)   dhcps_dns_ip   = param_set_default("");
+        if (dhcps_enabled)
+            ESP_LOGI(TAG, "DHCP server enabled: pool %s-%s, lease %lu min",
+                     dhcps_start_ip, dhcps_end_ip, (unsigned long)dhcps_lease_min);
+    }
 
     // Load LED GPIO setting from NVS (default -1 = disabled)
     int led_gpio_setting = -1;

@@ -913,6 +913,51 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                 httpd_resp_send(req, NULL, 0);
                 return ESP_OK;
             }
+
+            /* Handle DHCP server settings */
+            if (httpd_query_key_value(buf, "dhcps_save", param1, sizeof(param1)) == ESP_OK) {
+                if (httpd_query_key_value(buf, "dhcps_enabled", param1, sizeof(param1)) == ESP_OK) {
+                    int en = atoi(param1);
+                    if (en && !(static_ip && strlen(static_ip) > 0)) {
+                        en = 0;
+                        ESP_LOGW(TAG, "DHCP server requires static IP; ignoring enable request");
+                    }
+                    set_config_param_int("dhcps_enabled", en);
+                    dhcps_enabled = (en != 0);
+                }
+                if (httpd_query_key_value(buf, "dhcps_start", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    set_config_param_str("dhcps_start_ip", param1);
+                    free(dhcps_start_ip);
+                    dhcps_start_ip = strdup(param1);
+                }
+                if (httpd_query_key_value(buf, "dhcps_end", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    set_config_param_str("dhcps_end_ip", param1);
+                    free(dhcps_end_ip);
+                    dhcps_end_ip = strdup(param1);
+                }
+                if (httpd_query_key_value(buf, "dhcps_lease", param1, sizeof(param1)) == ESP_OK) {
+                    int lease = atoi(param1);
+                    if (lease >= 1 && lease <= 14400) {
+                        set_config_param_int("dhcps_lease", lease);
+                        dhcps_lease_min = (uint32_t)lease;
+                    }
+                }
+                if (httpd_query_key_value(buf, "dhcps_dns", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    set_config_param_str("dhcps_dns", param1);
+                    free(dhcps_dns_ip);
+                    dhcps_dns_ip = strdup(param1);
+                }
+                ESP_LOGI(TAG, "DHCP server settings saved via web");
+                esp_timer_start_once(restart_timer, 500000);
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/config");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
         }
         free(buf);
     }
@@ -1007,6 +1052,19 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     snprintf(section, sizeof(section), CONFIG_CHUNK_MGMT_IP,
         static_ip, subnet_mask, gateway_addr);
     httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 5b: DHCP Server Settings */
+    {
+        const char *dhcps_en_chk  = dhcps_enabled ? "checked" : "";
+        const char *dhcps_dis_chk = dhcps_enabled ? "" : "checked";
+        snprintf(section, sizeof(section), CONFIG_CHUNK_DHCPS,
+            dhcps_en_chk, dhcps_dis_chk,
+            (dhcps_start_ip && dhcps_start_ip[0]) ? dhcps_start_ip : "",
+            (dhcps_end_ip   && dhcps_end_ip[0])   ? dhcps_end_ip   : "",
+            (unsigned long)dhcps_lease_min,
+            (dhcps_dns_ip   && dhcps_dns_ip[0])   ? dhcps_dns_ip   : "");
+        httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+    }
 
     /* Chunk 6: Hostname */
     snprintf(section, sizeof(section), CONFIG_CHUNK_HOSTNAME,
