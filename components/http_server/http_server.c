@@ -356,13 +356,15 @@ esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
 }
 
 char* html_escape(const char* src) {
-    //Primitive html attribute escape, should handle most common issues.
+    //HTML escape for both attribute and element-content contexts.
+    //Encodes < > & " ' \ # ; as numeric entities (&#NN;), so attacker-controlled
+    //strings (e.g. scanned SSIDs) cannot inject markup or break out of attributes.
     int len = strlen(src);
     //Every char in the string + a null
     int esc_len = len + 1;
 
     for (int i = 0; i < len; i++) {
-        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';' || src[i] == '<' || src[i] == '>') {
             //Will be replaced with a 5 char sequence
             esc_len += 4;
         }
@@ -376,7 +378,7 @@ char* html_escape(const char* src) {
 
     int j = 0;
     for (int i = 0; i < len; i++) {
-        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';' || src[i] == '<' || src[i] == '>') {
             res[j++] = '&';
             res[j++] = '#';
             res[j++] = '0' + (src[i] / 10);
