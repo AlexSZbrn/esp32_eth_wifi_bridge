@@ -27,6 +27,8 @@
 #include "esp_wifi.h"
 
 #include "lwip/ip4_addr.h"
+#include "esp_netif.h"
+#include "dhcpserver/dhcpserver.h"
 
 #include "mbedtls/sha256.h"
 #include "esp_random.h"
@@ -56,6 +58,7 @@
 static const char *TAG = "cmd_router";
 
 static void register_set_hostname(void);
+static void register_dhcps(void);
 static void register_set_ap_mac_only(void);
 static void register_set_mgmt_ip(void);
 static void register_set_ap(void);
@@ -75,6 +78,7 @@ static void register_set_tx_power(void);
 static void register_remote_console_cmd(void);
 static void register_syslog_cmd(void);
 static void register_set_tz(void);
+static void register_set_wifi_country(void);
 #if defined(CONFIG_ETH_UPLINK_W5500)
 static void register_set_spi_clock(void);
 static void register_w5500(void);
@@ -267,6 +271,8 @@ void register_router(void)
     register_remote_console_cmd();
     register_syslog_cmd();
     register_set_tz();
+    register_set_wifi_country();
+    register_dhcps();
 #if defined(CONFIG_ETH_UPLINK_W5500)
     register_set_spi_clock();
     register_w5500();
@@ -296,6 +302,11 @@ int set_mgmt_ip(int argc, char **argv)
         nvs_erase_key(nvs, "static_ip");
         nvs_erase_key(nvs, "subnet_mask");
         nvs_erase_key(nvs, "gateway_addr");
+        if (dhcps_enabled) {
+            nvs_set_i32(nvs, "dhcps_enabled", 0);
+            dhcps_enabled = false;
+            printf("Note: DHCP server disabled (incompatible with DHCP client mode).\n");
+        }
         err = nvs_commit(nvs);
         nvs_close(nvs);
         if (err == ESP_OK) {
@@ -995,6 +1006,17 @@ static int show(int argc, char **argv)
         printf("  Channel: %s", ap_channel > 0 ? "" : "auto\n");
         if (ap_channel > 0) printf("%d\n", ap_channel);
         printf("  Hidden: %s\n", ap_ssid_hidden ? "yes" : "no");
+        printf("  Country Code: %s\n", wifi_country_code);
+
+        printf("\nDHCP Server: %s\n", dhcps_enabled ? "enabled" : "disabled");
+        if (dhcps_enabled) {
+            printf("  Pool: %s - %s\n",
+                   (dhcps_start_ip && dhcps_start_ip[0]) ? dhcps_start_ip : "(default)",
+                   (dhcps_end_ip   && dhcps_end_ip[0])   ? dhcps_end_ip   : "(default)");
+            printf("  Lease: %lu min\n", (unsigned long)dhcps_lease_min);
+            printf("  DNS: %s\n",
+                   (dhcps_dns_ip && dhcps_dns_ip[0]) ? dhcps_dns_ip : "(self)");
+        }
 
         char* web_lock = NULL;
         get_config_param_str("web_disabled", &web_lock);
@@ -1495,8 +1517,14 @@ static int set_ap_channel_cmd(int argc, char **argv)
     }
 
     int channel_val = atoi(argv[1]);
-    if (channel_val < 0 || channel_val > 13) {
-        printf("Invalid channel. Use 0 (auto) or 1-13.\n");
+    wifi_country_t country_info;
+    int max_channel = 13;
+    if (esp_wifi_get_country(&country_info) == ESP_OK) {
+        max_channel = country_info.schan + country_info.nchan - 1;
+    }
+    if (channel_val < 0 || channel_val > max_channel) {
+        printf("Invalid channel. Use 0 (auto) or 1-%d (country: %s).\n",
+               max_channel, wifi_country_code);
         return 1;
     }
 
@@ -1519,9 +1547,70 @@ static void register_set_ap_channel(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "set_ap_channel",
-        .help = "Set AP WiFi channel (0=auto, 1-13=fixed, requires restart)",
+        .help = "Set AP WiFi channel (0=auto, 1-13 max depends on country code, requires restart)",
         .hint = NULL,
         .func = &set_ap_channel_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_wifi_country' command - set WiFi regulatory country code */
+static int set_wifi_country_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Current country code: %s\n", wifi_country_code);
+        printf("Usage: set_wifi_country <CC>\n");
+        printf("  CC: 2-char ISO 3166 code (e.g. US, DE, GB) or 01 for world-safe\n");
+        printf("  Default: 01 (world-safe, all standard channels allowed)\n");
+        return 0;
+    }
+
+    const char *cc = argv[1];
+    if (strlen(cc) != 2) {
+        printf("Country code must be exactly 2 characters (e.g. US, DE, 01).\n");
+        return 1;
+    }
+
+    char upper[3];
+    upper[0] = toupper((unsigned char)cc[0]);
+    upper[1] = toupper((unsigned char)cc[1]);
+    upper[2] = '\0';
+
+    esp_err_t err = set_config_param_str("wifi_cc", upper);
+    if (err != ESP_OK) {
+        printf("Failed to save country code: %s\n", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_country_code[0] = upper[0];
+    wifi_country_code[1] = upper[1];
+    wifi_country_code[2] = '\0';
+
+    esp_err_t ret = esp_wifi_set_country_code(wifi_country_code, true);
+    if (ret == ESP_OK) {
+        wifi_country_t ci;
+        if (esp_wifi_get_country(&ci) == ESP_OK && ap_channel > 0) {
+            int max_ch = ci.schan + ci.nchan - 1;
+            if (ap_channel > max_ch) {
+                printf("Warning: ap_channel %d exceeds max channel %d for country %s.\n",
+                       ap_channel, max_ch, wifi_country_code);
+                printf("Run 'set_ap_channel 0' (auto) or a valid channel, then restart.\n");
+            }
+        }
+        printf("Country code set to %s (applied immediately, saved for reboot).\n", wifi_country_code);
+    } else {
+        printf("Country code %s saved. Could not apply now: %s\n", wifi_country_code, esp_err_to_name(ret));
+    }
+    return 0;
+}
+
+static void register_set_wifi_country(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_wifi_country",
+        .help = "Set WiFi regulatory country code (2-char ISO 3166, e.g. US, DE; or 01 for world-safe)",
+        .hint = NULL,
+        .func = &set_wifi_country_cmd,
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
@@ -1975,3 +2064,131 @@ static void register_w5500(void)
 }
 
 #endif // CONFIG_ETH_UPLINK_W5500
+
+/* 'dhcps' command — manage the built-in DHCP server */
+static int dhcps_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        // Print current config and active leases
+        printf("DHCP Server: %s\n", dhcps_enabled ? "enabled" : "disabled");
+        printf("  Pool:  %s - %s\n",
+               (dhcps_start_ip && dhcps_start_ip[0]) ? dhcps_start_ip : "(default)",
+               (dhcps_end_ip   && dhcps_end_ip[0])   ? dhcps_end_ip   : "(default)");
+        printf("  Lease: %lu min\n", (unsigned long)dhcps_lease_min);
+        printf("  DNS:   %s\n",
+               (dhcps_dns_ip && dhcps_dns_ip[0]) ? dhcps_dns_ip : "(self)");
+
+        if (dhcps_enabled && br_netif) {
+            esp_netif_pair_mac_ip_t pairs[CONFIG_LWIP_DHCPS_MAX_STATION_NUM];
+            memset(pairs, 0, sizeof(pairs));
+            if (esp_netif_dhcps_get_clients_by_mac(br_netif,
+                    CONFIG_LWIP_DHCPS_MAX_STATION_NUM, pairs) == ESP_OK) {
+                int shown = 0;
+                for (int i = 0; i < CONFIG_LWIP_DHCPS_MAX_STATION_NUM; i++) {
+                    if (pairs[i].ip.addr != 0) {
+                        if (!shown++) printf("\nActive leases:\n");
+                        printf("  %02X:%02X:%02X:%02X:%02X:%02X  " IPSTR "\n",
+                               pairs[i].mac[0], pairs[i].mac[1], pairs[i].mac[2],
+                               pairs[i].mac[3], pairs[i].mac[4], pairs[i].mac[5],
+                               IP2STR(&pairs[i].ip));
+                    }
+                }
+                if (!shown) printf("  (no active leases)\n");
+            }
+        }
+        return 0;
+    }
+
+    const char *action = argv[1];
+
+    if (strcmp(action, "enable") == 0) {
+        char *si = NULL;
+        get_config_param_str("static_ip", &si);
+        bool has_sip = (si && strlen(si) > 0);
+        free(si);
+        if (!has_sip) {
+            printf("Error: DHCP server requires static IP. Run 'set_mgmt_ip' first.\n");
+            return 1;
+        }
+        set_config_param_int("dhcps_enabled", 1);
+        dhcps_enabled = true;
+        printf("DHCP server enabled. Reboot to apply.\n");
+        printf("Warning: disable your upstream DHCP server to avoid address conflicts.\n");
+        return 0;
+
+    } else if (strcmp(action, "disable") == 0) {
+        set_config_param_int("dhcps_enabled", 0);
+        dhcps_enabled = false;
+        printf("DHCP server disabled. Reboot to apply.\n");
+        return 0;
+
+    } else if (strcmp(action, "range") == 0) {
+        if (argc < 4) {
+            printf("Usage: dhcps range <start_ip> <end_ip>\n");
+            return 1;
+        }
+        uint32_t start_addr = esp_ip4addr_aton(argv[2]);
+        uint32_t end_addr   = esp_ip4addr_aton(argv[3]);
+        if (start_addr == 0 || end_addr == 0) {
+            printf("Error: invalid IP address\n");
+            return 1;
+        }
+        if (ntohl(end_addr) <= ntohl(start_addr)) {
+            printf("Error: end_ip must be greater than start_ip\n");
+            return 1;
+        }
+        if (ntohl(end_addr) - ntohl(start_addr) + 1 > 100) {
+            printf("Error: pool too large (max 100 addresses)\n");
+            return 1;
+        }
+        set_config_param_str("dhcps_start_ip", argv[2]);
+        set_config_param_str("dhcps_end_ip",   argv[3]);
+        free(dhcps_start_ip); dhcps_start_ip = strdup(argv[2]);
+        free(dhcps_end_ip);   dhcps_end_ip   = strdup(argv[3]);
+        printf("DHCP pool: %s - %s. Reboot to apply.\n", argv[2], argv[3]);
+        return 0;
+
+    } else if (strcmp(action, "lease_time") == 0) {
+        if (argc < 3) {
+            printf("Usage: dhcps lease_time <minutes>\n");
+            return 1;
+        }
+        int minutes = atoi(argv[2]);
+        if (minutes < 1 || minutes > 14400) {
+            printf("Error: lease time must be 1-14400 minutes\n");
+            return 1;
+        }
+        set_config_param_int("dhcps_lease", minutes);
+        dhcps_lease_min = (uint32_t)minutes;
+        printf("DHCP lease time: %d min. Reboot to apply.\n", minutes);
+        return 0;
+
+    } else if (strcmp(action, "dns") == 0) {
+        const char *dns = (argc >= 3) ? argv[2] : "";
+        if (strlen(dns) > 0 && esp_ip4addr_aton(dns) == 0) {
+            printf("Error: invalid IP address\n");
+            return 1;
+        }
+        set_config_param_str("dhcps_dns", dns);
+        free(dhcps_dns_ip); dhcps_dns_ip = strdup(dns);
+        printf("DHCP DNS: %s. Reboot to apply.\n",
+               strlen(dns) > 0 ? dns : "(bridge IP)");
+        return 0;
+
+    } else {
+        printf("Usage: dhcps [enable|disable|range <start> <end>|lease_time <min>|dns <ip>]\n");
+        return 1;
+    }
+}
+
+static void register_dhcps(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "dhcps",
+        .help = "Manage built-in DHCP server. Usage: dhcps [enable|disable|range <s> <e>|lease_time <min>|dns <ip>]",
+        .hint = NULL,
+        .func = &dhcps_cmd,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}

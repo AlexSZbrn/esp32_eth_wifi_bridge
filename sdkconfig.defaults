@@ -55,3 +55,6 @@ CONFIG_ETH_IRAM_OPTIMIZATION=y
 
 # OTA
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# DHCP server capacity: both ETH and WiFi clients share one pool (default is 8)
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=16

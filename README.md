@@ -6,7 +6,7 @@ Firmware that creates a plain transparent Layer 2 bridge between an Ethernet por
 
 <img src="https://github.com/martin-ger/esp32_eth_wifi_bridge/blob/master/topology.png">
 
-All WiFi clients receive their IP addresses from the upstream network's DHCP server and are directly reachable from the wired side. The bridge itself can optionally obtain a management IP (static or DHCP) for web access and remote administration.
+By default, all clients receive their IP addresses from the upstream network's DHCP server. Optionally, the bridge can run its own DHCP server and hand out leases to devices on **both** sides — Ethernet and WiFi — from a single pool. The bridge itself can obtain a management IP (static or DHCP) for web access and remote administration.
 
 All settings are managed through a browser-based web interface or via the serial console at 115200 bps.
 
@@ -58,10 +58,9 @@ More details this setup can be found in this [repo](https://github.com/martin-ge
 
 ## Use Cases
 
-- **Wireless extension for a wired network** — add WiFi access to a switch or router that has no wireless capability
-- **Lab bridge** — give WiFi clients direct L2 access to devices on a wired bench segment
+- **Wireless extension for a wired network** — add WiFi access to a switch or router that has no wireless capability (classic WiFi AP)
 - **Transparent monitoring tap** — capture and inspect all bridged traffic in Wireshark without any client changes
-- **Headless IoT bridge** — connect WiFi sensors and devices directly to an existing wired LAN
+- **Stand-alone Ethernet/WiFi network** — set up a self-contained combined Ethernet/WiFi network segment (using the build-in DHCP server)
 
 ---
 
@@ -70,11 +69,11 @@ More details this setup can be found in this [repo](https://github.com/martin-ge
 - Transparent Layer 2 bridging between Ethernet and WiFi AP
 - WiFi AP with configurable SSID, password, channel, and authentication (WPA2/WPA3)
 - Optional management IP (static or DHCP) for web and remote access
+- Optional built-in DHCP server — serves Ethernet and WiFi clients from a single configurable pool
 - Packet capture to Wireshark over TCP (PCAP streaming, promiscuous mode)
 - Remote console — password-protected TCP CLI on a configurable port
 - Syslog forwarding — ship ESP log output to a remote syslog server via UDP
 - OTA firmware update through the web interface
-- Byte counters for the Ethernet interface
 - Configurable WiFi TX power, status LED, and timezone
 - AP interface can be enabled/disabled at runtime
 - All settings persisted in NVS flash; survive firmware updates
@@ -107,6 +106,7 @@ Grouped into sections. Changes trigger a reboot to apply.
 
 - *AP Settings* — SSID, password, channel, authentication mode (WPA2/WPA3), hidden SSID, enable/disable
 - *Management IP* — static IP, subnet mask, gateway; leave empty to use DHCP
+- *DHCP Server* — enable/disable, pool start/end, lease time, DNS override
 - *DNS Server* — override DNS for AP clients
 - *Remote Console* — enable/disable, port, interface binding (AP/ETH), idle timeout
 - *PCAP Packet Capture* — on/off toggle, snaplen
@@ -117,6 +117,46 @@ Grouped into sections. Changes trigger a reboot to apply.
 ### Password Protection
 
 Set a password with `set_router_password <password>` or through the web interface. When set, the Configuration page requires authentication. Sessions last 30 minutes. Clear the password by setting an empty string.
+
+---
+
+## DHCP Server
+
+The bridge can serve IP addresses to devices on both the Ethernet and WiFi AP sides from a single address pool. This is useful when there is no upstream DHCP server, or when you want the bridge to control the IP range.
+
+**Requirements:**
+- A static management IP must be configured (`set_mgmt_ip`) before enabling — the DHCP server needs a fixed address to operate from.
+- The upstream DHCP server (e.g., on your router) should be disabled or have its scope restricted to avoid address conflicts. The bridge cannot block upstream DHCP offers.
+- Changes require a reboot to take effect.
+
+### Setup
+
+```
+set_mgmt_ip 192.168.10.1 255.255.255.0 192.168.10.1
+dhcps range 192.168.10.50 192.168.10.200
+dhcps lease_time 120
+dhcps enable
+restart
+```
+
+After reboot, devices connecting to the WiFi AP or Ethernet port will receive addresses from the configured pool. The bridge IP (192.168.10.1 in the example above) is used as the default gateway and DNS server unless overridden:
+
+```
+dhcps dns 8.8.8.8
+```
+
+### Commands
+
+```
+dhcps                           Show status and active leases
+dhcps enable                    Enable DHCP server (requires static IP, reboot to apply)
+dhcps disable                   Disable DHCP server (reboot to apply)
+dhcps range <start_ip> <end_ip> Set pool address range (max 100 addresses)
+dhcps lease_time <minutes>      Set lease duration (1–14400 min, default 120)
+dhcps dns <ip>                  Set DNS server to advertise (empty = bridge IP)
+```
+
+To revert to using the upstream DHCP server, run `set_mgmt_ip dhcp` (this also disables the built-in DHCP server) and reboot.
 
 ---
 
@@ -198,9 +238,16 @@ Connect via serial at 115200 bps, or via the remote console.
 | `set_ap_hidden <on\|off>` | Hide or show AP SSID |
 | `set_ap_auth <wpa2\|wpa3\|wpa2wpa3>` | Set AP authentication mode |
 | `set_ap_channel <0-13>` | Set AP WiFi channel (0=auto) |
+| `set_wifi_country <CC>` | Set WiFi regulatory country code (2-char ISO 3166, e.g. `US`, `DE`; use `01` for world-safe) |
 | `ap <enable\|disable>` | Enable or disable AP interface |
 | `set_mgmt_ip <ip> <mask> <gw>` | Set static management IP |
 | `set_mgmt_ip dhcp` | Revert management IP to DHCP |
+| `dhcps` | Show DHCP server status and active leases |
+| `dhcps enable` | Enable built-in DHCP server (requires static IP, reboot to apply) |
+| `dhcps disable` | Disable built-in DHCP server (reboot to apply) |
+| `dhcps range <start> <end>` | Set address pool (max 100 addresses) |
+| `dhcps lease_time <minutes>` | Set lease duration (1–14400, default 120) |
+| `dhcps dns <ip>` | DNS server to advertise (empty = bridge IP) |
 | `set_hostname <name>` | Set DHCP hostname |
 | `set_tx_power <dBm>` | Set WiFi transmit power (2-20, 0=max) |
 | `set_tz <TZ string>` | Set POSIX timezone |
@@ -365,7 +412,7 @@ set_ap MyWiFiSSID MyPassword
 restart
 ```
 
-The bridge will reboot. Connect a WiFi client to the AP — it will receive an IP from the upstream network's DHCP server. You can then access the web interface at `http://esp32-bridge.local` (mDNS) or set a static management IP:
+The bridge will reboot. Connect a WiFi client to the AP — it will receive an IP from the upstream network's DHCP server (or from the bridge's own DHCP server if configured). You can then access the web interface at `http://esp32-bridge.local` (mDNS) or set a static management IP:
 
 ```
 set_mgmt_ip 192.168.1.200 255.255.255.0 192.168.1.1

@@ -356,13 +356,15 @@ esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
 }
 
 char* html_escape(const char* src) {
-    //Primitive html attribute escape, should handle most common issues.
+    //HTML escape for both attribute and element-content contexts.
+    //Encodes < > & " ' \ # ; as numeric entities (&#NN;), so attacker-controlled
+    //strings (e.g. scanned SSIDs) cannot inject markup or break out of attributes.
     int len = strlen(src);
     //Every char in the string + a null
     int esc_len = len + 1;
 
     for (int i = 0; i < len; i++) {
-        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';' || src[i] == '<' || src[i] == '>') {
             //Will be replaced with a 5 char sequence
             esc_len += 4;
         }
@@ -376,7 +378,7 @@ char* html_escape(const char* src) {
 
     int j = 0;
     for (int i = 0; i < len; i++) {
-        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';' || src[i] == '<' || src[i] == '>') {
             res[j++] = '&';
             res[j++] = '#';
             res[j++] = '0' + (src[i] / 10);
@@ -774,9 +776,29 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                     // Handle AP channel setting
                     if (httpd_query_key_value(buf, "ap_channel", param5, sizeof(param5)) == ESP_OK) {
                         int channel_val = atoi(param5);
-                        if (channel_val >= 0 && channel_val <= 13) {
+                        wifi_country_t _ci2;
+                        int max_ch = 13;
+                        if (esp_wifi_get_country(&_ci2) == ESP_OK) {
+                            max_ch = _ci2.schan + _ci2.nchan - 1;
+                        }
+                        if (channel_val >= 0 && channel_val <= max_ch) {
                             set_config_param_int("ap_channel", channel_val);
                             ap_channel = (uint8_t)channel_val;
+                        }
+                    }
+
+                    // Handle WiFi country code setting
+                    if (httpd_query_key_value(buf, "wifi_cc", param5, sizeof(param5)) == ESP_OK) {
+                        if (strlen(param5) == 2) {
+                            char upper[3];
+                            upper[0] = toupper((unsigned char)param5[0]);
+                            upper[1] = toupper((unsigned char)param5[1]);
+                            upper[2] = '\0';
+                            set_config_param_str("wifi_cc", upper);
+                            wifi_country_code[0] = upper[0];
+                            wifi_country_code[1] = upper[1];
+                            wifi_country_code[2] = '\0';
+                            esp_wifi_set_country_code(wifi_country_code, true);
                         }
                     }
 
@@ -893,6 +915,51 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                 httpd_resp_send(req, NULL, 0);
                 return ESP_OK;
             }
+
+            /* Handle DHCP server settings */
+            if (httpd_query_key_value(buf, "dhcps_save", param1, sizeof(param1)) == ESP_OK) {
+                if (httpd_query_key_value(buf, "dhcps_enabled", param1, sizeof(param1)) == ESP_OK) {
+                    int en = atoi(param1);
+                    if (en && !(static_ip && strlen(static_ip) > 0)) {
+                        en = 0;
+                        ESP_LOGW(TAG, "DHCP server requires static IP; ignoring enable request");
+                    }
+                    set_config_param_int("dhcps_enabled", en);
+                    dhcps_enabled = (en != 0);
+                }
+                if (httpd_query_key_value(buf, "dhcps_start", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    set_config_param_str("dhcps_start_ip", param1);
+                    free(dhcps_start_ip);
+                    dhcps_start_ip = strdup(param1);
+                }
+                if (httpd_query_key_value(buf, "dhcps_end", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    set_config_param_str("dhcps_end_ip", param1);
+                    free(dhcps_end_ip);
+                    dhcps_end_ip = strdup(param1);
+                }
+                if (httpd_query_key_value(buf, "dhcps_lease", param1, sizeof(param1)) == ESP_OK) {
+                    int lease = atoi(param1);
+                    if (lease >= 1 && lease <= 14400) {
+                        set_config_param_int("dhcps_lease", lease);
+                        dhcps_lease_min = (uint32_t)lease;
+                    }
+                }
+                if (httpd_query_key_value(buf, "dhcps_dns", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    set_config_param_str("dhcps_dns", param1);
+                    free(dhcps_dns_ip);
+                    dhcps_dns_ip = strdup(param1);
+                }
+                ESP_LOGI(TAG, "DHCP server settings saved via web");
+                esp_timer_start_once(restart_timer, 500000);
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/config");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
         }
         free(buf);
     }
@@ -969,11 +1036,16 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     httpd_resp_send_chunk(req, CONFIG_CHUNK_SCRIPT, HTTPD_RESP_USE_STRLEN);
 
     /* Chunk 4: AP Settings */
+    wifi_country_t _ci;
+    int max_channel = 13;
+    if (esp_wifi_get_country(&_ci) == ESP_OK) {
+        max_channel = _ci.schan + _ci.nchan - 1;
+    }
     const char* auth_sel0 = (ap_authmode == 0) ? "selected" : "";
     const char* auth_sel1 = (ap_authmode == 1) ? "selected" : "";
     const char* auth_sel2 = (ap_authmode == 2) ? "selected" : "";
     snprintf(section, sizeof(section), CONFIG_CHUNK_AP,
-        safe_ap_ssid, (int)ap_channel,
+        safe_ap_ssid, max_channel, (int)ap_channel, wifi_country_code,
         auth_sel0, auth_sel1, auth_sel2,
         ap_en_checked, ap_open_checked, ap_hidden_checked);
     httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
@@ -982,6 +1054,19 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     snprintf(section, sizeof(section), CONFIG_CHUNK_MGMT_IP,
         static_ip, subnet_mask, gateway_addr);
     httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 5b: DHCP Server Settings */
+    {
+        const char *dhcps_en_chk  = dhcps_enabled ? "checked" : "";
+        const char *dhcps_dis_chk = dhcps_enabled ? "" : "checked";
+        snprintf(section, sizeof(section), CONFIG_CHUNK_DHCPS,
+            dhcps_en_chk, dhcps_dis_chk,
+            (dhcps_start_ip && dhcps_start_ip[0]) ? dhcps_start_ip : "",
+            (dhcps_end_ip   && dhcps_end_ip[0])   ? dhcps_end_ip   : "",
+            (unsigned long)dhcps_lease_min,
+            (dhcps_dns_ip   && dhcps_dns_ip[0])   ? dhcps_dns_ip   : "");
+        httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+    }
 
     /* Chunk 6: Hostname */
     snprintf(section, sizeof(section), CONFIG_CHUNK_HOSTNAME,

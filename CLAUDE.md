@@ -129,6 +129,7 @@ set_ap_mac <AA> <BB> <CC> <DD> <EE> <FF>  # Override AP MAC
 set_ap_hidden <on|off>            # Hide/show AP SSID
 set_ap_auth <wpa2|wpa3|wpa2wpa3>  # Set AP auth mode
 set_ap_channel <0-13>             # Set AP channel (0=auto)
+set_wifi_country <CC>             # Set WiFi regulatory country code (2-char ISO 3166, e.g. US, DE; 01=world-safe)
 ap <enable|disable>               # Enable/disable AP at runtime
 set_router_password <password>    # Set web/console password (empty to disable)
 web_ui enable                     # Enable web interface (after reboot)
